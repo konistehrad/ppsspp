@@ -11,6 +11,7 @@ else()
     GL/wglew.h
     glew.c
   )
+	add_definitions(-DGLEW_EGL)
   add_library(Ext::GLEW ALIAS glew)
   target_link_libraries(glew PUBLIC ${OPENGL_LIBRARIES})
   target_compile_definitions(glew PUBLIC GLEW_STATIC)

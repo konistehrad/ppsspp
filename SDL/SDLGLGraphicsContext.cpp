@@ -16,6 +16,16 @@
 #include "EGL/egl.h"
 #endif
 
+#if defined(USING_KMS)
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <cstdio>
+#include <gbm.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+static const char device_name[] = "/dev/dri/card0";
+#endif
+
 class GLRenderManager;
 
 #if defined(USING_EGL)
@@ -28,6 +38,54 @@ static EGLNativeDisplayType     g_Display       = nullptr;
 static bool                     g_XDisplayOpen  = false;
 static EGLNativeWindowType      g_Window        = (EGLNativeWindowType)nullptr;
 static bool useEGLSwap = false;
+
+#if defined(USING_KMS)
+static int driFd = -1;
+
+struct kms {
+   drmModeConnector *connector;
+   drmModeEncoder *encoder;
+   drmModeModeInfo mode;
+};
+
+static kms*
+setup_kms()
+{
+	drmModeRes *resources;
+	drmModeConnector *connector;
+	drmModeEncoder *encoder;
+	int i;
+	resources = drmModeGetResources(driFd);
+	if (!resources) {
+		printf("EGL ERROR: drmModeGetResources failed\n");
+		return NULL;
+	}
+	for (i = 0; i < resources->count_connectors; i++) {
+		connector = drmModeGetConnector(driFd, resources->connectors[i]);
+		if (connector == NULL) continue;
+		if (connector->connection == DRM_MODE_CONNECTED &&
+			connector->count_modes > 0) break;
+		drmModeFreeConnector(connector);
+	}
+	if (i == resources->count_connectors) {
+		printf("EGL ERROR: No currently active connector found.\n");
+		return NULL;
+	}
+	for (i = 0; i < resources->count_encoders; i++) {
+		encoder = drmModeGetEncoder(driFd, resources->encoders[i]);
+		if (encoder == NULL) continue;
+		if (encoder->encoder_id == connector->encoder_id) break;
+		drmModeFreeEncoder(encoder);
+	}
+
+	kms* result = new kms();
+	result->connector = connector;
+	result->encoder = encoder;
+	result->mode = connector->modes[0];
+	return result;
+}
+
+#endif
 
 int CheckEGLErrors(const char *file, int line) {
 	EGLenum error;
@@ -63,11 +121,11 @@ int CheckEGLErrors(const char *file, int line) {
 
 static bool EGL_OpenInit() {
 	if ((g_eglDisplay = eglGetDisplay(g_Display)) == EGL_NO_DISPLAY) {
-		EGL_ERROR("Unable to create EGL display.", true);
+		printf("Unable to create EGL display.\n");
 		return false;
 	}
 	if (eglInitialize(g_eglDisplay, NULL, NULL) != EGL_TRUE) {
-		EGL_ERROR("Unable to initialize EGL display.", true);
+		printf("Unable to initialize EGL display.\n");
 		eglTerminate(g_eglDisplay);
 		g_eglDisplay = EGL_NO_DISPLAY;
 		return false;
@@ -92,17 +150,21 @@ static int8_t EGL_Open(SDL_Window *window) {
 	SDL_VERSION(&sysInfo.version);
 	if (!SDL_GetWindowWMInfo(window, &sysInfo)) {
 		printf("ERROR: Unable to retrieve native window handle\n");
+#if USING_X11		
 		g_Display = (EGLNativeDisplayType)XOpenDisplay(nullptr);
 		g_XDisplayOpen = g_Display != nullptr;
 		if (!g_XDisplayOpen)
 			EGL_ERROR("Unable to get display!", false);
 		g_Window = (EGLNativeWindowType)nullptr;
+#endif
 	} else {
 		switch (sysInfo.subsystem) {
+#if defined(SDL_VIDEO_DRIVER_X11)
 		case SDL_SYSWM_X11:
 			g_Display = (EGLNativeDisplayType)sysInfo.info.x11.display;
 			g_Window = (EGLNativeWindowType)sysInfo.info.x11.window;
 			break;
+#endif
 #if defined(SDL_VIDEO_DRIVER_DIRECTFB)
 		case SDL_SYSWM_DIRECTFB:
 			g_Display = (EGLNativeDisplayType)EGL_DEFAULT_DISPLAY;
@@ -121,15 +183,56 @@ static int8_t EGL_Open(SDL_Window *window) {
 			g_Window = (EGLNativeWindowType)sysInfo.info.vivante.window;
 			break;
 #endif
+#if defined(SDL_VIDEO_DRIVER_KMSDRM) && defined(USING_KMS)
+		case SDL_SYSWM_UNKNOWN:
+			driFd = open(device_name, O_RDWR);
+			if (driFd < 0) {
+				/* Probably permissions error */
+				EGL_ERROR("Could not open card0!", true);
+			}
+			kms* kms = setup_kms();
+			if(kms == NULL)
+			{
+				printf("EGL ERROR: Could not initialie KMS!\n");
+				close(driFd);
+				driFd = -1;
+				return 1;
+			}
+
+			gbm_device* gbm = gbm_create_device(driFd);
+			g_Display = (EGLNativeDisplayType)gbm;
+			if (g_Display == NULL) {
+				printf("EGL ERROR: Could not create GBM device!\n");
+				close(driFd);
+				driFd = -1;
+				return 1;
+			}
+			g_Window = (EGLNativeWindowType)gbm_surface_create(gbm, kms->mode.hdisplay, kms->mode.vdisplay,
+				GBM_BO_FORMAT_XRGB8888,
+				GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+			delete kms;
+			if(g_Window == NULL)
+			{
+				printf("EGL ERROR: Could not create GBM surface!\n");
+				gbm_device_destroy(gbm);
+				close(driFd);
+				driFd = -1;
+				return 1;
+			}
+#endif
 		}
 
 		if (!EGL_OpenInit()) {
+			EGL_ERROR("EGL_OpenInit failed!", false);
+
+#if USING_X11			
 			// Let's try again with X11.
 			g_Display = (EGLNativeDisplayType)XOpenDisplay(nullptr);
 			g_XDisplayOpen = g_Display != nullptr;
 			if (!g_XDisplayOpen)
 				EGL_ERROR("Unable to get display!", false);
 			g_Window = (EGLNativeWindowType)nullptr;
+#endif
 		}
 	}
 
@@ -239,6 +342,7 @@ EGLConfig EGL_FindConfig(int *contextVersion) {
 
 int8_t EGL_Init(SDL_Window *window) {
 	int contextVersion = 0;
+	
 	EGLConfig eglConfig = EGL_FindConfig(&contextVersion);
 	if (!eglConfig) {
 		EGL_ERROR("Unable to find a usable EGL config.", true);
@@ -286,7 +390,7 @@ void EGL_Close() {
 		g_eglDisplay = EGL_NO_DISPLAY;
 	}
 	if (g_Display != nullptr) {
-#if !defined(USING_FBDEV)
+#if defined(USING_X11)
 		if (g_XDisplayOpen)
 			XCloseDisplay((Display *)g_Display);
 #endif
@@ -388,13 +492,15 @@ int SDLGLGraphicsContext::Init(SDL_Window *&window, int x, int y, int mode, std:
 	}
 #endif
 
-#ifndef USING_GLES2
+#if !defined(USING_GLES2)
 	// Some core profile drivers elide certain extensions from GL_EXTENSIONS/etc.
 	// glewExperimental allows us to force GLEW to search for the pointers anyway.
 	if (gl_extensions.IsCoreContext) {
 		glewExperimental = true;
 	}
-	if (GLEW_OK != glewInit()) {
+
+	GLenum result = glewInit();
+	if (GLEW_OK != result) {
 		printf("Failed to initialize glew!\n");
 		return 1;
 	}

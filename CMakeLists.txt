@@ -115,7 +115,9 @@ option(MIPS "Set to ON if targeting a MIPS processor" ${MIPS_DEVICE})
 option(X86 "Set to ON if targeting an X86 processor" ${X86_DEVICE})
 option(X86_64 "Set to ON if targeting an X86_64 processor" ${X86_64_DEVICE})
 # :: Environments
+option(USING_X11 "Set to ON if target environment uses X11" ${USING_X11})
 option(USING_EGL "Set to ON if target environment uses EGL" ${USING_EGL})
+option(USING_KMS "Set to ON if target environment uses KMS" ${USING_KMS})
 option(USING_FBDEV "Set to ON if target environment uses fbdev (eg. Pandora)" ${USING_FBDEV})
 option(USING_GLES2 "Set to ON if target device uses OpenGL ES 2.0" ${USING_GLES2})
 option(USING_X11_VULKAN "Set to OFF if target environment doesn't use X11 for Vulkan" ON)
@@ -198,6 +200,21 @@ if(USING_EGL)
 	set(OPENGL_LIBRARIES ${OPENGL_LIBRARIES} ${EGL_LIBRARIES})
 endif()
 
+if(USING_KMS)
+	if(NOT GBM_LIBRARIES)
+		find_library(GBM_LIBRARIES gbm REQUIRED)
+	endif()
+	set(OPENGL_LIBRARIES ${OPENGL_LIBRARIES} ${GBM_LIBRARIES})
+
+	find_package(Libdrm)
+	if(NOT Libdrm_FOUND)
+		message(STATUS "Could not find libDRM.")
+	else()
+		include_directories(${Libdrm_INCLUDE_DIRS})
+		set(OPENGL_LIBRARIES ${OPENGL_LIBRARIES} ${Libdrm_LIBRARIES})
+	endif()
+endif()
+
 if(NOT LIBRETRO)
 	find_package(SDL2)
 endif()
@@ -210,8 +227,14 @@ endif()
 
 include_directories("${CMAKE_SOURCE_DIR}")
 
+if(USING_X11)
+	add_definitions(-DUSING_X11)
+endif()
 if(USING_EGL)
 	add_definitions(-DUSING_EGL)
+endif()
+if(USING_KMS)
+	add_definitions(-DUSING_KMS)
 endif()
 if(USING_FBDEV)
 	add_definitions(-DUSING_FBDEV)
@@ -661,7 +684,7 @@ setup_target_project(Common Common)
 
 target_link_libraries(Common Ext::Snappy)
 
-if(USING_GLES2 OR (USING_EGL AND NOT USING_FBDEV))
+if(USING_X11)
 	find_package(X11)
 endif()
 
@@ -669,7 +692,6 @@ add_library(gason STATIC
     ext/gason/gason.cpp
     ext/gason/gason.h
 )
-
 
 if(USE_FFMPEG)
 	if(NOT FFMPEG_DIR)
